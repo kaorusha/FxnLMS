@@ -5,6 +5,7 @@ import scipy.signal as signal
 from scipy.optimize import minimize, differential_evolution
 import scipy.io.wavfile as wavfile
 from typing import Literal
+from read_path import load_rew_ir
 
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
@@ -406,88 +407,42 @@ def fit_iir_minimize(w_norm_target, h_target, num_biquads, target_fs=48000, weig
     print(f"Optimization Success: {result.success}, Final Loss: {result.fun:.6f}")
     return sos_opt
 
-def apply_tail_taper(data: np.ndarray, taper_ratio: float = 0.1) -> np.ndarray:
+def load_rew_ir_and_denoise(file_path: str, target_taps: int = 512, pre_peak_margin: int = 10, taper_ratio: float = 0.1, visualize: bool = False) -> np.ndarray:
     """
-    對脈衝響應的尾部進行平滑衰減 (Tapering)，以消除尾部的底噪。
-    
-    Args:
-        data (array): 脈衝響應數據
-        taper_ratio (float): 尾部平滑衰減的樣本數比例 (0 < taper_ratio < 1)
-    
-    Returns:
-        tapered_data (array): 經過尾部平滑衰減後的脈衝響應
-    """
-    taper_length = int(len(data) * taper_ratio)
-    if taper_length <= 0 or taper_length > len(data):
-        raise ValueError("taper_length 必須大於 0 且小於等於資料長度")
-    
-    # 建立右半邊的 Hann 窗
-    hann_half = np.hanning(taper_length * 2)[taper_length:]
-    
-    # 組合 Window: [1, 1, ..., 1, 0.99, 0.98, ..., 0]
-    window = np.concatenate([np.ones(len(data)-taper_length), hann_half])
-    return data * window
+    載入 REW 匯出的 TXT 脈衝響應，底層調用 read_path.load_rew_ir 進行截斷與尾部去底噪 (Windowing)。
 
-def load_rew_ir_and_denoise(file_path: str, target_taps: int = 512, pre_peak_margin: int = 10, taper_ratio: float = 0.1, visualize: bool = False):
-    """
-    載入 REW 匯出的 TXT 脈衝響應，利用標頭資訊進行截斷與尾部去底噪 (Windowing)，為了保留真實響應的強度，不進行正規化
     Args:
         file_path (str): REW 匯出的 TXT 檔案路徑
         target_taps (int): 目標 tap 數量
         pre_peak_margin (int): 峰值前的邊緣距離
         taper_ratio (float): 尾部平滑衰減的樣本數比例
         visualize (bool): 是否顯示視覺化結果
+
     Returns:
-        denoised_ir (array): 去底噪後的脈衝響應
+        denoised_ir (np.ndarray): 去底噪後的脈衝響應陣列
     """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"找不到檔案: {file_path}")
-
-    # 1. 讀取 REW 數據
-    print(f"正在載入 REW 數據: {file_path}")
-    peak_index = 0
-    data_start_line = 0
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
-        for i, line in enumerate(lines):
-            if "Peak index" in line:
-                peak_index = int(line.split()[0])
-            if "* Data start" in line:
-                data_start_line = i + 1
-                break
-    data = np.loadtxt(file_path, skiprows=data_start_line)
-    if data.ndim > 1:
-        data = data[:, 0]  # 如果有多欄，取第一欄作為脈衝響應數據
-
-    print(f"原始數據長度: {len(data)} 取樣點")
-    print(data[:10]) # 顯示前 10 個數據點以確認讀取正確
-    
-    # 2. 截斷訊號 (包含峰值前保留一點餘裕，以捕捉完整的上升緣)
-    start_idx = max(0, peak_index - pre_peak_margin)
-    print(f"截斷訊號: start_idx = {start_idx}")
-    end_idx = start_idx + target_taps
-    # 3. 長度不足時補零
-    if end_idx > len(data):
-        truncated_ir = np.pad(data[start_idx:], (0, end_idx - len(data)))
-    else:
-        truncated_ir = data[start_idx:end_idx].copy()
-
-    # 4. 尾部去底噪：應用右半邊的 Tukey 或 Hann 窗
-    denoised_ir = apply_tail_taper(truncated_ir, taper_ratio=taper_ratio)
-    
-    # 5. 正規化至 [-1, 1]
-    # S_hat = denoised_ir / np.max(np.abs(denoised_ir))
-
+    denoised_list, meta = load_rew_ir(
+        filepath=file_path,
+        target_taps=target_taps,
+        pre_peak_margin=pre_peak_margin,
+        taper_ratio=taper_ratio
+    )
+    denoised_ir = np.array(denoised_list, dtype=np.float64)
 
     if visualize:
+        truncated_ir = np.array(meta.get("truncated_ir", denoised_list), dtype=np.float64)
         plt.figure(figsize=(10, 4))
         plt.plot(truncated_ir, label="Truncated IR (Before Denoising)", alpha=0.5)
         plt.plot(denoised_ir, label="Denoised IR (After Windowing)", color='red')
-        plt.title(f"{file_path} Pre-processing")
+        filename = os.path.basename(file_path)
+        plt.title(f"{filename} Pre-processing (Peak: {meta.get('peak_index', 0)}, Margin: {pre_peak_margin}, Taper: {taper_ratio*100:.0f}%)")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Amplitude")
         plt.legend()
-        plt.grid()
+        plt.grid(True)
         plt.tight_layout()
         plt.show()
+
     return denoised_ir
 
 def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: float = 0.707):
@@ -1518,5 +1473,5 @@ if __name__ == "__main__":
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    sos_matrix = parse_rew_text_and_convert("REW_100hz_4000hz_biquad_100_duty_0827_1031.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 40), eval_cutoff=[100, 4000], frequencies_to_mark=[600, 3600])
+    sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 75), eval_cutoff=[300, 4000], frequencies_to_mark=[600, 3600])

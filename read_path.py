@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
@@ -150,6 +150,9 @@ def load_rew_ir(filepath: str,
     # Zero-pad if file ended prematurely
     if len(extracted) < target_taps:
         extracted.extend([0.0] * (target_taps - len(extracted)))
+
+    # 保存加窗前的截斷數據 (長度為 target_taps)，供視覺化前後對比使用
+    meta["truncated_ir"] = extracted.copy()
 
     # Apply tail tapering (Half-Hann window on the last taper_ratio portion)
     if 0.0 < taper_ratio < 1.0:
