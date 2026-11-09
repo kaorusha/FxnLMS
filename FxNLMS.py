@@ -1,11 +1,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import re
 import scipy.signal as signal
 from scipy.optimize import minimize, differential_evolution
 import scipy.io.wavfile as wavfile
 from typing import Literal
 from read_path import load_rew_ir
+
+# 韌體 repo (SC598) 的資料夾，second_path.h / feedback_path.h 由該 repo 的 tools/export_paths.py 產生
+FIRMWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'EV-SC598-SOM', 'Audio_Talkthrough_I2S')
 
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
@@ -472,6 +476,37 @@ def load_rew_ir_and_denoise(file_path: str, target_taps: int = 512, pre_peak_mar
         plt.show()
 
     return denoised_ir
+
+def load_anc_path_header(file_path: str) -> tuple:
+    """
+    讀取韌體的路徑標頭檔 (second_path.h / feedback_path.h)。
+    這兩個檔由 tools/export_paths.py 從板子經 48 kHz 核心邊界的量測產生，已包含 ADC/DAC、取樣率濾波器與
+    DMA 的全部延遲，直接使用即可，不要再從峰值前截取 (REW 的 IR 截取會把真實延遲拿掉)。
+
+    tap 定義與 run_fxnlms 相同：
+        - SECOND_PATH[k]：核心輸出 y(n-k) 對核心 Err(n) 的響應 (k = 0 為同一個取樣點)
+        - FEEDBACK_PATH[k]：y(n-1-k) 對核心 Ref(n) 的響應 (韌體在算出 y(n) 之前先扣回授，所以從 y(n-1) 開始)
+
+    Args:
+        file_path (str): 標頭檔路徑，例如 os.path.join(FIRMWARE_DIR, 'second_path.h')
+
+    Returns:
+        tuple: (taps, fs)
+            - taps (np.ndarray): 路徑脈衝響應係數
+            - fs (int): 取樣率 (ANC 核心取樣率)
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    array = re.search(r'static\s+const\s+float\s+\w+\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;', text, re.S)
+    n_taps = re.search(r'#define\s+\w+_TAPS\s+\(?(\d+)\)?', text)
+    fs = re.search(r'#define\s+\w+_TAPS_FS\s+\(\(uint32_t\)\s*(\d+)\)', text)
+    if array is None or n_taps is None or fs is None:
+        raise ValueError(f"無法解析路徑標頭檔: {file_path}")
+    taps = np.array([float(v.rstrip('fF')) for v in
+                     re.findall(r'[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?[fF]?', array.group(1))])
+    if len(taps) != int(n_taps.group(1)):
+        raise ValueError(f"{file_path}: 係數 {len(taps)} 個，與定義的 {n_taps.group(1)} 不符")
+    return taps, int(fs.group(1))
 
 def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: float = 0.707):
     """
@@ -1489,22 +1524,20 @@ def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bod
     plt.show()
 
 if __name__ == "__main__":
-    #dsp_fs = 384000  # DSP 取樣率
     dsp_fs = 48000
     flen = 1024
-    s_len = 2048
     record_name = "100_dual_36159_60s.npz"
     x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)
-    #F_z = load_rew_ir_and_denoise("R Aug 3 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
-    S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
-    #fir_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs=fs)
-    x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs)
-    #e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
-    #fir_dsp_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs= dsp_fs)
-    #compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter=fir_dsp_fs)
-    # 繪製結果
-    #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
-    #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 75), eval_cutoff=[300, 4000], frequencies_to_mark=[600, 3600])
+    # 板子經 48 kHz 核心邊界量到的 S (韌體 repo 的 second_path.h)
+    S_z, path_fs = load_anc_path_header(os.path.join(FIRMWARE_DIR, 'second_path.h'))
+    x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, path_fs=path_fs)
+    # 比較不濾波與迴路內參考帶通 (因果 IIR)，兩者都用未濾波的 d / e 評估
+    ref_sos = signal.butter(4, [400, 5000], 'bandpass', fs=dsp_fs, output='sos')
+    compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, fs=dsp_fs,
+                                        eval_filter=FIRFilter(cutoff=[300, 4000], fs=dsp_fs),
+                                        mu=0.007, filter_length=flen, leak=0.0)
+    # 舊的 ADAU1787 Biquad 流程 (8 月的 REW S，SC598 已不使用):
+    # S_rew = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
+    # sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    # simulate_biquad_anc(x_resample, d_resample, S_rew, sos_matrix, fs=dsp_fs, delay_samples=range(0, 75), eval_cutoff=[300, 4000], frequencies_to_mark=[600, 3600])
