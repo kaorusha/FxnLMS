@@ -11,6 +11,24 @@ from read_path import load_rew_ir
 # 韌體 repo (SC598) 的資料夾，second_path.h / feedback_path.h 由該 repo 的 tools/export_paths.py 產生
 FIRMWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'EV-SC598-SOM', 'Audio_Talkthrough_I2S')
 
+# 錄音電壓換算成數位單位用的滿刻度峰值電壓
+# 板子的 ADC (ADAU1979) 單端滿刻度 2.25 V rms：除以此值即為板子的 dBFS，與 second_path.h 的 S 同一單位
+# (假設 ADAU1787 J23 輸出直接接到載板 J12，前級增益與 8 月錄音時相同)
+ADAU1979_FULL_SCALE_VPEAK = 2.25 * np.sqrt(2)
+# 舊平台 ADAU1787 DAC 單端滿刻度 (0.5 V rms)，換算出的數值比板子單位高 13.1 dB；重現 W41 的結果時使用
+ADAU1787_FULL_SCALE_VPEAK = 0.707
+
+# 韌體 ANC 核心設定，模擬的預設值與韌體一致
+# (mu、epsilon 為 2026-11-09 建議的修正值，anc_fxnlms.h 尚未更新)
+FW_FS = 48000              # ANC 核心取樣率 (Hz)
+FW_W_TAPS = 2048           # W(z) 階數
+FW_MU = 0.01               # 搭配迴路內參考帶通 FW_REF_BAND
+FW_MU_NO_FILTER = 0.002    # 不濾波時的步長：低頻佔滿 x'，0.01 在 100% duty 會在低頻發散
+FW_LEAK = 1e-5             # 每個核心取樣的漏洩
+FW_EPSILON = 1e-11         # 正規化分母底限 (板子單位，約為風扇關閉時 2048 * x' 功率)
+FW_OUTPUT_LIMIT = 0.2      # 輸出限幅 ANC_SAFE_OUTPUT_LIMIT (100% duty 時 600 Hz 約需 0.2、3.6 kHz 約需 0.7)
+FW_REF_BAND = (400, 5000)  # 迴路內參考帶通 (Hz)
+
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
     產生複雜的噪音源 x(n)，包含主頻、倍頻和寬頻雜訊
@@ -87,11 +105,13 @@ def run_fxnlms(x: np.ndarray,
                S: np.ndarray,
                S_hat: np.ndarray,
                F_hat: np.ndarray = None,
-               mu: float = 0.1,
-               filter_length: int = 64,
-               leak: float = 1e-5,
+               mu: float = FW_MU,
+               filter_length: int = FW_W_TAPS,
+               leak: float = FW_LEAK,
                ref_sos: np.ndarray = None,
-               F: np.ndarray = None
+               F: np.ndarray = None,
+               eps: float = FW_EPSILON,
+               clamp: float = FW_OUTPUT_LIMIT
                ):
     """
     執行具備聲學回授中和(Feedback Neutralization) 的 FxNLMS 離線演算法模擬
@@ -107,9 +127,11 @@ def run_fxnlms(x: np.ndarray,
         F_hat (array): 回授路徑估測脈衝響應 Estimated Feedback Path (tap 0 對應 y(n-1))。None 表示不做回授中和
         F (array): 真實回授路徑 (tap 0 對應 y(n-1))。None 表示與 F_hat 相同 (回授被完全抵消)；
                    給不同的值可模擬 F_hat 的誤差
-        mu (float): 學習率
-        filter_length (int): 濾波器長度
-        leak (float): 權重衰減因子
+        mu (float): 正規化步長 (預設與韌體相同，搭配迴路內參考帶通；不濾波時用 FW_MU_NO_FILTER)
+        filter_length (int): W(z) 濾波器長度
+        leak (float): 每個取樣的權重漏洩
+        eps (float): 正規化分母底限，與訊號單位有關 (預設為板子單位)
+        clamp (float): 輸出限幅，y 超過 ±clamp 時截斷後才送出與存入歷史 (與韌體相同)；None 表示不限幅
         ref_sos (array): 迴路內參考濾波器 (scipy sos 格式，例如 signal.butter(4, [400, 5000], 'bandpass', output='sos'))。
                          None 表示不濾波。濾波器以因果方式逐點作用在回授中和後的參考訊號，再送進 W 與 S_hat，
                          和 DSP 即時執行的位置相同。d 一律不濾波：誤差麥克風收到的是未濾波的真實聲音，
@@ -121,6 +143,7 @@ def run_fxnlms(x: np.ndarray,
             - y (array): 抗噪喇叭發出的反相波
             - w (array): 最終的濾波器權重
             - x_net (array): 經過回授中和後的參考訊號
+    與韌體仍有的差異：x' 功率用 filter_length 點的窗口總和 (韌體用 0.999 的 IIR 平滑)，運算為 float64 (韌體 float32)。
     Examples:
         >>> import generate_input_signal, setup_acoustic_paths, run_fxnlms, plot_results
         >>> # 模擬參數設定
@@ -135,7 +158,10 @@ def run_fxnlms(x: np.ndarray,
         >>> e, y, w, x_net = run_fxnlms(x, d, S, S_hat, F_hat, mu, filter_length)
         >>> plot_results(x, e, Fs)
     """
+    # TODO(速度，暫不處理)：每個取樣都整列平移 x_history / x_prime_history / y_history (O(N) 複製)，
+    #       改成環狀緩衝區約可快 5 倍；離線模擬不要求速度
     T = len(x)
+    n_clipped = 0               # 輸出被限幅的取樣數
     w = np.zeros(filter_length) # 抗噪濾波器 W(z) 
     e = np.zeros(T)             # 儲存殘留噪音 (Error)
     y = np.zeros(T)             # 儲存抗噪喇叭發出的反相波
@@ -177,6 +203,10 @@ def run_fxnlms(x: np.ndarray,
         
         # c. 計算抗噪喇叭的輸出 y(n)
         y[i] = np.dot(w, x_history[:filter_length]) # 抗噪濾波器 W(z) 的輸出
+        # 輸出限幅：與韌體相同，先截斷再送到喇叭並存入回授歷史
+        if clamp is not None and abs(y[i]) > clamp:
+            y[i] = np.sign(y[i]) * clamp
+            n_clipped += 1
         
         # 更新喇叭輸出歷史紀錄
         y_history[1:] = y_history[:-1]
@@ -187,20 +217,20 @@ def run_fxnlms(x: np.ndarray,
         e[i] = d[i] + antinoise_at_mic # 注意：演算法會讓 y 自動變成反相，所以這裡是相加
         
         # e. NLMS 權重更新 (Normalized Weight Update)
-        epsilon = 1e-6  # 避免分母為零的微小常數
+        # eps: 正規化分母底限 (參數，與訊號單位有關)
         
         # 計算 Filtered-x 歷史陣列的當下總能量 (也就是所有元素的平方和)
         power = np.dot(x_prime_history, x_prime_history) 
         
         # 使用正規化公式更新權重
         # w = w - mu * e[i] * x_prime_history
-        w = w * (1 - leak) - (mu / (power + epsilon)) * e[i] * x_prime_history
+        w = w * (1 - leak) - (mu / (power + eps)) * e[i] * x_prime_history
 
     # 計算收斂後的降噪量
     d_power = np.mean(d[-10000:]**2)  # 取最後 10000 個樣本的平均功率
     e_power = np.mean(e[-10000:]**2)  # 取最後 10000 個樣本的平均功率
     attenuation_db = 10 * np.log10(d_power / e_power) if e_power > 0 else float('inf')
-    print(f"最終收斂後的降噪量: {attenuation_db:.2f} dB")
+    print(f"最終收斂後的降噪量: {attenuation_db:.2f} dB, 輸出限幅比例: {100 * n_clipped / max(T, 1):.1f}%")
 
     return (e, y, w, x_net)
 
@@ -525,16 +555,18 @@ def load_anc_path_header(file_path: str) -> tuple:
         raise ValueError(f"{file_path}: 係數 {len(taps)} 個，與定義的 {n_taps.group(1)} 不符")
     return taps, int(fs.group(1))
 
-def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: float = 0.707):
+def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: float = ADAU1979_FULL_SCALE_VPEAK):
     """
     讀取量測數據，並依據 DSP 硬體滿載電壓將其縮放至 [-1, 1]
 
     Args:
         file_path (str): 檔案路徑 (.npz 或 .wav)
-        dsp_full_scale_voltage (float): DSP 硬體 (ADAU1787) DAC 單端輸出的滿載峰值電壓。
-                                        依據 Datasheet，DAC 差動滿載為 1 V rms。
-                                        J23 為單端輸出，方均根電壓為 1 / 2 = 0.5 V rms。
-                                        換算峰值電壓為 0.5 * sqrt(2) = 0.707 V peak。
+        dsp_full_scale_voltage (float): 換算成數位單位用的滿載峰值電壓。
+                                        錄音是 ADAU1787 J23 輸出的電壓，現在由載板 J12 的 ADAU1979 數位化，
+                                        單端滿載 2.25 V rms = 3.18 V peak (預設 ADAU1979_FULL_SCALE_VPEAK)，
+                                        換算後與 second_path.h 的 S、韌體的限幅與 epsilon 同一單位。
+                                        舊平台 ADAU1787 DAC 差動滿載 1 V rms，J23 單端為 0.5 V rms = 0.707 V peak
+                                        (ADAU1787_FULL_SCALE_VPEAK)，數值比板子單位高 13.1 dB；重現 W41 的結果時使用。
     
     Returns:
         tuple: (x_scaled, d_scaled, fs, metadata)
@@ -757,7 +789,8 @@ def run_anc_simulation(x: np.ndarray, rew_file_path: str, target_taps: int = 512
     # 執行 FxNLMS 訓練
     print("正在執行 FxNLMS 訓練...")
     F = np.zeros(target_taps)
-    e, y, w_fir, x_net = run_fxnlms(x, d_n, S, S_hat, F, mu=mu, filter_length=filter_length)
+    # 舊流程 (REW 的 S、模擬的 P)，保持原本的 leak / epsilon、不限幅
+    e, y, w_fir, x_net = run_fxnlms(x, d_n, S, S_hat, F, mu=mu, filter_length=filter_length, leak=1e-5, eps=1e-6, clamp=None)
     
     # 繪製結果
     plot_time_domain_residual_comparison(x, e)
@@ -993,6 +1026,7 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
                                         frequencies_to_mark: tuple = (600, 3600),
                                         lf_band: tuple = (100, 300),
                                         visualize: bool = True,
+                                        mu_no_filter: float = None,
                                         **fxnlms_kwargs) -> dict:
     """
     比較「不濾波」與「參考訊號在迴路內濾波」兩種 FxNLMS，兩者都用未濾波的 d 與同一次模擬的 e 評估。
@@ -1014,6 +1048,8 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         frequencies_to_mark (tuple): 要標示窄頻降噪量的頻率 (Hz)
         lf_band (tuple): 檢查低頻惡化的頻帶 (Hz)
         visualize (bool): 是否繪圖
+        mu_no_filter (float): 不濾波那次的步長 (例如 FW_MU_NO_FILTER)；None 表示與濾波那次相同。
+                              不濾波時低頻佔滿 x'，同樣的步長可能在低頻發散，所以兩者通常要用各自穩定的步長比較
         **fxnlms_kwargs: 傳給 run_fxnlms 的其餘參數 (mu、filter_length、leak 等)，兩次模擬相同；
                          例如 F=... 可模擬 F_hat 與真實回授路徑不同
 
@@ -1023,8 +1059,11 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
     """
     results = {}
     for label, sos in (('no filter', None), ('in-loop filter', ref_sos)):
-        print(f"\n=== {label} ===")
-        e, y, w, _ = run_fxnlms(x, d, S, S_hat, F_hat, ref_sos=sos, **fxnlms_kwargs)
+        kwargs = dict(fxnlms_kwargs)
+        if sos is None and mu_no_filter is not None:
+            kwargs['mu'] = mu_no_filter
+        print(f"\n=== {label}, mu = {kwargs.get('mu', FW_MU)} ===")
+        e, y, w, _ = run_fxnlms(x, d, S, S_hat, F_hat, ref_sos=sos, **kwargs)
         f, attenuation, marked = plot_psd_comparison(d, e, fs=fs, nfft=8192,
                                                      frequencies_to_mark=list(frequencies_to_mark),
                                                      visualize=visualize)
@@ -1542,20 +1581,22 @@ def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bod
     plt.show()
 
 if __name__ == "__main__":
-    dsp_fs = 48000
-    flen = 1024
+    dsp_fs = FW_FS
     record_name = "100_dual_36159_60s.npz"
-    x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)
+    x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)   # 板子單位 (ADAU1979 滿刻度)
     # 板子經 48 kHz 核心邊界量到的 S / F (韌體 repo 的 second_path.h / feedback_path.h)
     # 錄音時喇叭靜音，x 不含回授；run_fxnlms 會把喇叭回授 F 加回參考麥克風，再用 F_hat 扣掉
     S_z, path_fs = load_anc_path_header(os.path.join(FIRMWARE_DIR, 'second_path.h'))
     F_z, _ = load_anc_path_header(os.path.join(FIRMWARE_DIR, 'feedback_path.h'))
     x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, path_fs=path_fs)
     # 比較不濾波與迴路內參考帶通 (因果 IIR)，兩者都用未濾波的 d / e 評估
-    ref_sos = signal.butter(4, [400, 5000], 'bandpass', fs=dsp_fs, output='sos')
+    # 其餘參數用韌體預設值 (FW_*)；限幅放到 DAC 滿刻度 1.0，先比較濾波器位置本身的效果
+    # (韌體的 FW_OUTPUT_LIMIT = 0.2 在 100% duty 會一直截斷：600 Hz 約需 0.2、3.6 kHz 約需 0.7)
+    # 不濾波時用 FW_MU_NO_FILTER：用 FW_MU 會在低頻發散 (100-300 Hz 惡化約 -47 dB)
+    ref_sos = signal.butter(4, FW_REF_BAND, 'bandpass', fs=dsp_fs, output='sos')
     compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, fs=dsp_fs,
-                                        eval_filter=FIRFilter(cutoff=[300, 4000], fs=dsp_fs),
-                                        mu=0.007, filter_length=flen, leak=0.0)
+                                        eval_filter=FIRFilter(cutoff=[300, 4000], fs=dsp_fs), clamp=1.0,
+                                        mu_no_filter=FW_MU_NO_FILTER)
     # 舊的 ADAU1787 Biquad 流程 (8 月的 REW S，SC598 已不使用):
     # S_rew = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     # sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
