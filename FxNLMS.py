@@ -86,20 +86,27 @@ def run_fxnlms(x: np.ndarray,
                d: np.ndarray,
                S: np.ndarray,
                S_hat: np.ndarray,
-               F_hat: np.ndarray,
+               F_hat: np.ndarray = None,
                mu: float = 0.1,
                filter_length: int = 64,
                leak: float = 1e-5,
-               ref_sos: np.ndarray = None
+               ref_sos: np.ndarray = None,
+               F: np.ndarray = None
                ):
     """
     執行具備聲學回授中和(Feedback Neutralization) 的 FxNLMS 離線演算法模擬
+
+    物理模型：喇叭聲經回授路徑 F 傳回參考麥克風，Ref(n) = x(n) + sum_k F[k] y(n-1-k)；
+    演算法再扣掉估計的回授 F_hat，u(n) = Ref(n) - sum_k F_hat[k] y(n-1-k)。
+    錄音是喇叭靜音時錄的，x 不含回授，所以回授必須在模擬中加回去；只扣 F_hat 而不加 F 會憑空多出一個回授迴路。
     Args:
-        x (array): 輸入訊號, 參考麥克風(含原始噪音與喇叭回授)
+        x (array): 輸入訊號, 參考麥克風錄音 (喇叭靜音時錄的，不含喇叭回授)
         d (array): 目標訊號, 誤差麥克風
         S (array): 次級路徑脈衝響應 Secondary Path
         S_hat (array): 次級路徑估測脈衝響應 Estimated Secondary Path
-        F_hat (array): 回授路徑估測脈衝響應 Estimated Feedback Path
+        F_hat (array): 回授路徑估測脈衝響應 Estimated Feedback Path (tap 0 對應 y(n-1))。None 表示不做回授中和
+        F (array): 真實回授路徑 (tap 0 對應 y(n-1))。None 表示與 F_hat 相同 (回授被完全抵消)；
+                   給不同的值可模擬 F_hat 的誤差
         mu (float): 學習率
         filter_length (int): 濾波器長度
         leak (float): 權重衰減因子
@@ -137,12 +144,22 @@ def run_fxnlms(x: np.ndarray,
     # 為了計算卷積，我們需要歷史記憶體 (Buffers)
     x_history = np.zeros(max(filter_length, len(S_hat)))
     x_prime_history = np.zeros(filter_length)
-    y_history = np.zeros(max(len(S), len(F_hat)))
+    if F_hat is None:
+        F_hat = np.zeros(1)
+    if F is None:
+        F = F_hat
+    # F 與 F_hat 相同時，加回的回授與扣掉的估計完全抵消，參考訊號就是錄音 x
+    feedback_cancels = len(F) == len(F_hat) and np.array_equal(F, F_hat)
+    y_history = np.zeros(max(len(S), len(F_hat), len(F)))
     ref_filter = CausalSOSFilter(ref_sos) if ref_sos is not None else None
 
     for i in range(T):
-        # a. 回授中和 (Feedback Neutralization)
-        x_net[i] = x[i] - np.dot(F_hat, y_history[:len(F_hat)])
+        # a. 喇叭回授 (物理) 與回授中和 (Feedback Neutralization)：y_history[0] 此時為 y(n-1)
+        if feedback_cancels:
+            x_net[i] = x[i]
+        else:
+            ref_mic = x[i] + np.dot(F, y_history[:len(F)])
+            x_net[i] = ref_mic - np.dot(F_hat, y_history[:len(F_hat)])
 
         # a2. 迴路內參考濾波 (因果 IIR)：在回授中和之後、送進 W 與 S_hat 之前，與 DSP 相同
         u = ref_filter.step(x_net[i]) if ref_filter is not None else x_net[i]
@@ -997,7 +1014,8 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         frequencies_to_mark (tuple): 要標示窄頻降噪量的頻率 (Hz)
         lf_band (tuple): 檢查低頻惡化的頻帶 (Hz)
         visualize (bool): 是否繪圖
-        **fxnlms_kwargs: 傳給 run_fxnlms 的其餘參數 (mu、filter_length、leak 等)，兩次模擬相同
+        **fxnlms_kwargs: 傳給 run_fxnlms 的其餘參數 (mu、filter_length、leak 等)，兩次模擬相同；
+                         例如 F=... 可模擬 F_hat 與真實回授路徑不同
 
     Returns:
         dict: {'no filter': {...}, 'in-loop filter': {...}}，各含 e, y, w, f, attenuation, marked,
@@ -1528,9 +1546,10 @@ if __name__ == "__main__":
     flen = 1024
     record_name = "100_dual_36159_60s.npz"
     x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)
-    F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
-    # 板子經 48 kHz 核心邊界量到的 S (韌體 repo 的 second_path.h)
+    # 板子經 48 kHz 核心邊界量到的 S / F (韌體 repo 的 second_path.h / feedback_path.h)
+    # 錄音時喇叭靜音，x 不含回授；run_fxnlms 會把喇叭回授 F 加回參考麥克風，再用 F_hat 扣掉
     S_z, path_fs = load_anc_path_header(os.path.join(FIRMWARE_DIR, 'second_path.h'))
+    F_z, _ = load_anc_path_header(os.path.join(FIRMWARE_DIR, 'feedback_path.h'))
     x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, path_fs=path_fs)
     # 比較不濾波與迴路內參考帶通 (因果 IIR)，兩者都用未濾波的 d / e 評估
     ref_sos = signal.butter(4, [400, 5000], 'bandpass', fs=dsp_fs, output='sos')
