@@ -57,17 +57,36 @@ def setup_acoustic_paths(sz_file_path: str = None, target_taps: int = 64):
         S[3] = 0.3 # 模擬抗噪喇叭的低通特性
     
     # 3. 假設估測路徑 S_hat(z) 與真實路徑 S(z) 一致
-    S_hat = S.copy() 
+    S_hat = S.copy()
     return P, S, S_hat
-    
-def run_fxnlms(x: np.ndarray, 
-               d: np.ndarray, 
-               S: np.ndarray, 
-               S_hat: np.ndarray, 
-               F_hat: np.ndarray, 
-               mu: float = 0.1, 
-               filter_length: int = 64, 
-               leak: float = 1e-5
+
+class CausalSOSFilter:
+    """
+    逐點因果 IIR 濾波器 (二階節串接，Direct Form II Transposed)，與 scipy.signal.sosfilt 結果相同。
+    用於 FxNLMS 迴路內：每個取樣點只用到現在與過去的輸入，和 DSP 即時執行的方式一致。
+    """
+    def __init__(self, sos: np.ndarray):
+        self.sections = [tuple(float(c) for c in row) for row in np.atleast_2d(sos)]
+        self.state = [[0.0, 0.0] for _ in self.sections]
+
+    def step(self, v: float) -> float:
+        """輸入一個取樣點，回傳濾波後的一個取樣點"""
+        for (b0, b1, b2, _, a1, a2), z in zip(self.sections, self.state):
+            out = b0 * v + z[0]
+            z[0] = b1 * v - a1 * out + z[1]
+            z[1] = b2 * v - a2 * out
+            v = out
+        return v
+
+def run_fxnlms(x: np.ndarray,
+               d: np.ndarray,
+               S: np.ndarray,
+               S_hat: np.ndarray,
+               F_hat: np.ndarray,
+               mu: float = 0.1,
+               filter_length: int = 64,
+               leak: float = 1e-5,
+               ref_sos: np.ndarray = None
                ):
     """
     執行具備聲學回授中和(Feedback Neutralization) 的 FxNLMS 離線演算法模擬
@@ -75,11 +94,16 @@ def run_fxnlms(x: np.ndarray,
         x (array): 輸入訊號, 參考麥克風(含原始噪音與喇叭回授)
         d (array): 目標訊號, 誤差麥克風
         S (array): 次級路徑脈衝響應 Secondary Path
-        S_hat (array): 次級路徑估測脈衝響應 Estimated Secondary Path 
+        S_hat (array): 次級路徑估測脈衝響應 Estimated Secondary Path
         F_hat (array): 回授路徑估測脈衝響應 Estimated Feedback Path
         mu (float): 學習率
         filter_length (int): 濾波器長度
         leak (float): 權重衰減因子
+        ref_sos (array): 迴路內參考濾波器 (scipy sos 格式，例如 signal.butter(4, [400, 5000], 'bandpass', output='sos'))。
+                         None 表示不濾波。濾波器以因果方式逐點作用在回授中和後的參考訊號，再送進 W 與 S_hat，
+                         和 DSP 即時執行的位置相同。d 一律不濾波：誤差麥克風收到的是未濾波的真實聲音，
+                         因此回傳的 e 與 d 可直接相減比較頻譜。
+                         (不要用零相位濾波 x、d 訓練 W 後再拿未濾波的 x 計算：W 在帶外沒有被訓練，凍結後帶外會被放大)
     Returns:
         tuple: (e, y, w, x_net)
             - e (array): 殘留噪音
@@ -110,14 +134,18 @@ def run_fxnlms(x: np.ndarray,
     x_history = np.zeros(max(filter_length, len(S_hat)))
     x_prime_history = np.zeros(filter_length)
     y_history = np.zeros(max(len(S), len(F_hat)))
+    ref_filter = CausalSOSFilter(ref_sos) if ref_sos is not None else None
 
     for i in range(T):
         # a. 回授中和 (Feedback Neutralization)
         x_net[i] = x[i] - np.dot(F_hat, y_history[:len(F_hat)])
 
+        # a2. 迴路內參考濾波 (因果 IIR)：在回授中和之後、送進 W 與 S_hat 之前，與 DSP 相同
+        u = ref_filter.step(x_net[i]) if ref_filter is not None else x_net[i]
+
         # 更新歷史參考訊號
         x_history[1:] = x_history[:-1]
-        x_history[0] = x_net[i]
+        x_history[0] = u
         
         # b. 計算 Filtered-x (也就是 x_prime)：將參考訊號 x 通過 S_hat
         x_prime = np.dot(S_hat, x_history[:len(S_hat)])
@@ -787,6 +815,8 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
         plt.tight_layout()
         plt.show()
 
+    return f_d, attenuation, marked_info
+
 class FIRFilter:
     """
     FIR 濾波器類別 (支援因果濾波、嚴格零相位濾波與波德圖繪製)
@@ -865,29 +895,26 @@ class FIRFilter:
         """繪製波德圖 (Bode Diagram)"""
         plot_bode_diagram(self.coeff, fs=self.fs, title=title)
 
-def filter_and_resampling(x: np.ndarray, 
-                            d: np.ndarray, 
-                            S_z: np.ndarray,  
-                            F_z: np.ndarray, 
-                            original_fs: int = 48000,
-                            target_fs: int = 48000,
-                            filter: FIRFilter = None
-                            ) -> tuple:
+def resample_for_dsp(x: np.ndarray,
+                     d: np.ndarray,
+                     S_z: np.ndarray,
+                     F_z: np.ndarray,
+                     original_fs: int = 48000,
+                     target_fs: int = 48000,
+                     path_fs: int = 48000
+                     ) -> tuple:
     """
-    proprocess, with filtering and resampling, for ANC simulation.
-    bandpass filtering is optional, if bandpass_filter_sos is None, no filtering will be applied.
-    use scipy.signal.sosfilt for filtering, to avoid phase distortion like scipy.signal.filtfilt, and use
-    scipy.signal.resample_poly for resampling, which is more efficient and less memory intensive than scipy.signal.resample.
-
+    將錄音與路徑脈衝響應重取樣到 DSP 取樣率 (scipy.signal.resample_poly 多相濾波)。
+    這裡不做帶通濾波：參考濾波器要放在 FxNLMS 迴路內 (run_fxnlms 的 ref_sos)，誤差訊號 d 不濾波。
 
     Args:
         x (np.ndarray): 參考麥克風訊號
         d (np.ndarray): 誤差麥克風訊號
         S_z (np.ndarray): 次級路徑脈衝響應
         F_z (np.ndarray): 回饋路徑脈衝響應
-        original_fs (int): 原始取樣率
-        target_fs (int): 目標取樣率
-        filter_sos (np.ndarray): 濾波器係數
+        original_fs (int): 錄音的原始取樣率
+        target_fs (int): 目標取樣率 (DSP)
+        path_fs (int): 路徑脈衝響應的取樣率
 
     Returns:
         tuple: (x_resample, d_resample, S_z_resample, F_z_resample)
@@ -896,68 +923,74 @@ def filter_and_resampling(x: np.ndarray,
             - S_z_resample (np.ndarray): 經過重取樣後的次級路徑脈衝響應
             - F_z_resample (np.ndarray): 經過重取樣後的回饋路徑脈衝響應
     """
-    
-    # 對參考訊號與誤差訊號進行帶通濾波
-    if filter is not None:
-        x_filtered = filter.filter_zero_phase(x)
-        d_filtered = filter.filter_zero_phase(d)
-    else:
-        x_filtered = x
-        d_filtered = d
-
-    x_resample = resample_data(x_filtered, original_fs=original_fs, target_fs=target_fs)
-    d_resample = resample_data(d_filtered, original_fs=original_fs, target_fs=target_fs)
-    F_z_resample = resample_data(F_z, original_fs=48000, target_fs=target_fs)
-    S_z_resample = resample_data(S_z, original_fs=48000, target_fs=target_fs)
-    
-    return x_resample, d_resample, S_z_resample, F_z_resample
-
-def compare_anc_result_with_and_without_filter(x: np.ndarray, 
-                                                 d: np.ndarray, 
-                                                 S_z: np.ndarray,
-                                                 original_fs: int, 
-                                                 target_fs: int, w_fir: np.ndarray, 
-                                                 filter: FIRFilter):
-    """
-    比較濾波in-band與full-band的 ANC 模擬結果w_fir，並繪製功率譜密度 (PSD) 與降噪深度。
-    use scipy.signal.lfilter for filtering, to avoid phase distortion like scipy.signal.filtfilt.
-
-    Args:
-        x (np.ndarray): 參考麥克風訊號(未濾波前)
-        d (np.ndarray): 誤差麥克風訊號(未濾波前)
-        S_z (np.ndarray): 次級路徑脈衝響應
-        original_fs (int): 原始取樣率，原始未濾波前的x和d的取樣頻率
-        target_fs (int): 目標取樣率
-        w_fir (np.ndarray): 用濾波訊號跑 FxNLMS 訓練後的 FIR 權重
-        filter_sos (np.ndarray): 帶通濾波器係數
-    """
     x_resample = resample_data(x, original_fs=original_fs, target_fs=target_fs)
     d_resample = resample_data(d, original_fs=original_fs, target_fs=target_fs)
-    y_test = signal.lfilter(w_fir, [1.0], x_resample)
-    anti_noise = signal.lfilter(S_z, [1.0], y_test)
-    e_test = d_resample + anti_noise
-    # 計算收斂後的降噪量
-    eval_length = 10000  # 評估最後 10000 個樣本的降噪量
-    d_power = np.mean(d_resample[-eval_length:]**2)  # 取最後 10000 個樣本的平均功率
-    e_power = np.mean(e_test[-eval_length:]**2)  # 取最後 10000 個樣本的平均功率
-    attenuation_db = 10 * np.log10(d_power / e_power) if e_power > 0 else float('inf')
+    F_z_resample = resample_data(F_z, original_fs=path_fs, target_fs=target_fs)
+    S_z_resample = resample_data(S_z, original_fs=path_fs, target_fs=target_fs)
 
-    # 帶內能量評估
-    d_eval_inband = filter.filter_zero_phase(d_resample[:-eval_length])
-    e_eval_inband = filter.filter_zero_phase(e_test[:-eval_length])
-    
-    d_power_inband = np.mean(d_eval_inband**2)
-    e_power_inband = np.mean(e_eval_inband**2)
-    att_inband = 10 * np.log10(d_power_inband / e_power_inband )if e_power_inband > 0 else float('inf')
-    
-    print("\n--- 降噪效能報告 ---")
-    print(f"全頻段降噪量 (受帶外噪聲掩蔽): {attenuation_db:.2f} dB")
-    print(f"有效頻段 (100-4000Hz) 降噪量:  {att_inband:.2f} dB")
-    print("--------------------\n") 
-    
-    # 繪製 PSD 與降噪深度比較
-    plot_time_domain_residual_comparison(d_resample, e_test, fs=target_fs)
-    plot_psd_comparison(d_resample, e_test, fs=target_fs, nfft=8192)
+    return x_resample, d_resample, S_z_resample, F_z_resample
+
+def compare_anc_with_and_without_filter(x: np.ndarray,
+                                        d: np.ndarray,
+                                        S: np.ndarray,
+                                        S_hat: np.ndarray,
+                                        F_hat: np.ndarray,
+                                        ref_sos: np.ndarray,
+                                        fs: int = 48000,
+                                        eval_filter: FIRFilter = None,
+                                        frequencies_to_mark: tuple = (600, 3600),
+                                        lf_band: tuple = (100, 300),
+                                        visualize: bool = True,
+                                        **fxnlms_kwargs) -> dict:
+    """
+    比較「不濾波」與「參考訊號在迴路內濾波」兩種 FxNLMS，兩者都用未濾波的 d 與同一次模擬的 e 評估。
+
+    濾波器只作用在送進 W 與 S_hat 的參考訊號 (run_fxnlms 的 ref_sos)，誤差麥克風的 d / e 不濾波，
+    所以 ANC on 的 e 與 ANC off 的 d 可以直接相減比較頻譜。
+    舊流程以零相位濾波 x、d 訓練 W，再凍結 W 套用到未濾波的 x：W 在帶外沒有被訓練，凍結後帶外會被放大，
+    而且使用時拿掉了濾波器，結果不代表 DSP 實際執行的情況。
+
+    Args:
+        x (np.ndarray): 參考麥克風訊號 (已重取樣到 fs，未濾波)
+        d (np.ndarray): 誤差麥克風訊號 (已重取樣到 fs，未濾波)
+        S (np.ndarray): 次級路徑脈衝響應
+        S_hat (np.ndarray): 次級路徑估測脈衝響應
+        F_hat (np.ndarray): 回授路徑估測脈衝響應
+        ref_sos (np.ndarray): 迴路內參考濾波器 (scipy sos 格式)
+        fs (int): 取樣率
+        eval_filter (FIRFilter): 選用，計算評估頻段降噪量的濾波器 (事後分析，可以用零相位)
+        frequencies_to_mark (tuple): 要標示窄頻降噪量的頻率 (Hz)
+        lf_band (tuple): 檢查低頻惡化的頻帶 (Hz)
+        visualize (bool): 是否繪圖
+        **fxnlms_kwargs: 傳給 run_fxnlms 的其餘參數 (mu、filter_length、leak 等)，兩次模擬相同
+
+    Returns:
+        dict: {'no filter': {...}, 'in-loop filter': {...}}，各含 e, y, w, f, attenuation, marked,
+              lf_worst_db, full_band_db, in_band_db
+    """
+    results = {}
+    for label, sos in (('no filter', None), ('in-loop filter', ref_sos)):
+        print(f"\n=== {label} ===")
+        e, y, w, _ = run_fxnlms(x, d, S, S_hat, F_hat, ref_sos=sos, **fxnlms_kwargs)
+        f, attenuation, marked = plot_psd_comparison(d, e, fs=fs, nfft=8192,
+                                                     frequencies_to_mark=list(frequencies_to_mark),
+                                                     visualize=visualize)
+        # 與 plot_psd_comparison 相同，取後半段 (已收斂) 計算
+        half = min(len(d), len(e)) // 2
+        full_band_db = 10 * np.log10(np.mean(d[half:]**2) / np.mean(e[half:]**2))
+        lf = (f >= lf_band[0]) & (f <= lf_band[1])
+        lf_worst_db = attenuation[lf].min()
+        in_band_db = None
+        if eval_filter is not None:
+            d_in = eval_filter.filter_zero_phase(d[half:])
+            e_in = eval_filter.filter_zero_phase(e[half:])
+            in_band_db = 10 * np.log10(np.mean(d_in**2) / np.mean(e_in**2))
+        print(f"全頻段降噪量: {full_band_db:+.2f} dB"
+              + ("" if in_band_db is None else f", 評估頻段降噪量: {in_band_db:+.2f} dB")
+              + f", {lf_band[0]}-{lf_band[1]} Hz 最差: {lf_worst_db:+.2f} dB")
+        results[label] = dict(e=e, y=y, w=w, f=f, attenuation=attenuation, marked=marked,
+                              lf_worst_db=lf_worst_db, full_band_db=full_band_db, in_band_db=in_band_db)
+    return results
 
 # ==========================================
 # 工具一：時間軸截斷與加窗 (Time-Domain Windowing)
@@ -1466,7 +1499,7 @@ if __name__ == "__main__":
     F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
     S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     #fir_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs=fs)
-    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=None)
+    x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs)
     #e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
     #fir_dsp_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs= dsp_fs)
     #compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter=fir_dsp_fs)
