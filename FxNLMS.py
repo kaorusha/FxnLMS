@@ -10,6 +10,8 @@ from read_path import load_rew_ir
 
 # 韌體 repo (SC598) 的資料夾，second_path.h / feedback_path.h 由該 repo 的 tools/export_paths.py 產生
 FIRMWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'EV-SC598-SOM', 'Audio_Talkthrough_I2S')
+# NIDAQ.py 的錄音存在本 repo 的 measurements/YYYY-MM-DD/ (gitignored)
+MEASUREMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'measurements')
 
 # 錄音電壓換算成數位單位用的滿刻度峰值電壓
 # 板子的 ADC (ADAU1979) 單端滿刻度 2.25 V rms：除以此值即為板子的 dBFS，與 second_path.h 的 S 同一單位
@@ -1669,7 +1671,8 @@ def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bod
 
 if __name__ == "__main__":
     dsp_fs = FW_FS
-    record_name = "100_dual_36159_60s.npz"
+    # 錄音在 MEASUREMENTS_DIR/<錄音日期>/ (NIDAQ.py 存檔的位置)
+    record_name = os.path.join(MEASUREMENTS_DIR, '2026-08-04', '100_dual_36159_60s.npz')
     tones = fan_tones(record_name)   # (轉速音, BPF) 的約略值，由檔名的轉速算出；實際頻率在 compare 裡從 Ref 找
     x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)   # 板子單位 (ADAU1979 滿刻度)
     # 板子經 48 kHz 核心邊界量到的 S / F (韌體 repo 的 second_path.h / feedback_path.h)
