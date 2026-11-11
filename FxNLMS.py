@@ -565,7 +565,7 @@ def load_anc_path_header(file_path: str) -> tuple:
 
 def fan_tones(record_name: str, blades: int = FAN_BLADES) -> tuple:
     """
-    由錄音檔名的轉速算出風扇轉速音 f0 與葉片通過頻率 (BPF) 的約略值，當作 locate_tones() 的起點。
+    由錄音的轉速算出風扇轉速音 f0 與葉片通過頻率 (BPF) 的約略值，當作 locate_tones() 的起點。
 
     用途：決定要量哪一條線，評估時不必依轉速寫死 600 / 3600 Hz。
     locate_tones() 只在起點 ±5% 內找最大的峰，量到哪一條線取決於起點；單看頻譜也分不出 f0 與 2f0
@@ -574,6 +574,9 @@ def fan_tones(record_name: str, blades: int = FAN_BLADES) -> tuple:
     檔名的轉速沒有跟著錄音更新時不會報錯，而是量到別條線，例如 50% duty 的錄音給 600 / 3600 Hz 會量到 2f0 與 12f0。
     compare_anc_with_and_without_filter() 在實際頻率與起點差超過 TONE_GUESS_TOL 時警告 (20%、30% duty 會觸發)，
     但這種剛好落在倍頻上的情況擋不住。
+
+    轉速來源：npz 裡有 rpm 欄位 (NIDAQ.py 錄音時存入) 時以它為準，檔案改名也不受影響；
+    沒有這個欄位的錄音 (舊錄音、wav) 才從檔名讀，並做下面的檔名檢驗。
 
     檔名檢驗：須為 <duty>_dual_<rpm>_<秒數>s，後面可接 _備註 與副檔名，
     例如 100_dual_36159_60s.npz -> 36159 rpm -> (602.65, 3615.9) Hz。
@@ -590,6 +593,11 @@ def fan_tones(record_name: str, blades: int = FAN_BLADES) -> tuple:
         ValueError: 檔名不符合格式，或 duty、rpm 超出範圍
     """
     name = os.path.basename(record_name)
+    if name.lower().endswith('.npz') and os.path.exists(record_name):
+        with np.load(record_name) as z:
+            if 'rpm' in z:
+                f_rot = float(z['rpm']) / 60.0
+                return f_rot, blades * f_rot
     m = re.fullmatch(r'(\d+)_dual_(\d+)_\d+(?:\.\d+)?s(?:[_.].*)?', name)
     if m is None:
         raise ValueError(f"檔名不符合 <duty>_dual_<rpm>_<秒數>s: {name}")

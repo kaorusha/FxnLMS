@@ -3,6 +3,11 @@ import nidaqmx
 from nidaqmx.constants import AcquisitionType, TerminalConfiguration, Coupling
 import scipy.io.wavfile as wavfile
 import os
+import re
+import datetime
+
+# 錄音存到這個 repo 的 measurements/YYYY-MM-DD/ (gitignored)，和用它的 FxNLMS.py 放在一起
+MEASUREMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'measurements')
 
 def acquire_ni9234_dual_channel(
     device_name: str, 
@@ -84,7 +89,7 @@ def acquire_ni9234_dual_channel(
     
     return x_data, d_data, actual_fs
 
-def save_acquisition_data(filename: str, x_data: np.ndarray, d_data: np.ndarray, fs: float, format: str = 'wav'):
+def save_acquisition_data(filename: str, x_data: np.ndarray, d_data: np.ndarray, fs: float, format: str = 'wav', **meta):
     """
     將雙通道擷取數據儲存至硬碟。
     
@@ -94,8 +99,12 @@ def save_acquisition_data(filename: str, x_data: np.ndarray, d_data: np.ndarray,
         d_data (np.ndarray): 誤差麥克風電壓陣列。
         fs (float): 實際取樣頻率。
         format (str): 'wav' 或 'npz'。
+        **meta: 一併存進 npz 的量測條件，例如 duty=100, rpm=36159 (wav 不存)。
     """
-    base_name = os.path.splitext(filename)[0]
+    # 只去掉 .wav / .npz：名稱裡的小數點不是副檔名 (例如 50_dual_17960_2.5s)
+    base_name, ext = os.path.splitext(filename)
+    if ext.lower() not in ('.wav', '.npz'):
+        base_name = filename
     
     if format.lower() == 'wav':
         # 合併為雙通道陣列，形狀為 (samples, channels)
@@ -111,25 +120,61 @@ def save_acquisition_data(filename: str, x_data: np.ndarray, d_data: np.ndarray,
     elif format.lower() == 'npz':
         out_name = f"{base_name}.npz"
         # 儲存為未壓縮的 NumPy 二進位檔案，保留 64-bit 精度
-        np.savez(out_name, x=x_data, d=d_data, fs=fs)
+        np.savez(out_name, x=x_data, d=d_data, fs=fs, **meta)
         print(f"數據已儲存為 NumPy 陣列: {out_name}")
         
     else:
         raise ValueError("不支援的格式。請選擇 'wav' 或 'npz'。")
 
-def run_daq(device_name: str, fs: int = 48000, duration_sec: float = 5.0, filename: str = "acquisition"):
+def record_name(duty: int, rpm: int, duration_sec: float, tag: str = '') -> str:
     """
-    執行 NI-9234 雙通道擷取並儲存數據。
-    
+    由量測條件組出錄音檔名 <duty>_dual_<rpm>_<秒數>s[_<標籤>] (不含副檔名)，
+    例如 (100, 36159, 60.0) -> 100_dual_36159_60s，(100, 36159, 10, 'refA') -> 100_dual_36159_10s_refA。
+
+    用途：FxNLMS.py 的 fan_tones() 用這個轉速決定評估時要量哪一條線 (轉速音 f0 與 BPF)，
+    轉速填錄音當下的讀數即可，與實際值差 5% 以內都找得到。檔名由程式組成，不必手打整串名稱。
+    標籤標示 mic 位置等條件：同一天同樣 duty、轉速的多次錄音靠它區分 (例如調 mic 位置找相干性時)。
+
+    Raises:
+        ValueError: duty 不在 1-100、轉速不大於 0 (與 fan_tones() 的檔名檢驗相同)，或標籤有英數字和 - 以外的字元
+    """
+    if not (1 <= duty <= 100) or rpm <= 0:
+        raise ValueError(f"duty ({duty}) 須在 1-100、轉速 ({rpm}) 須大於 0")
+    if tag and not re.fullmatch(r'[A-Za-z0-9-]+', tag):
+        raise ValueError(f"標籤 ({tag}) 只能用英數字和 -")
+    return f"{duty}_dual_{rpm}_{duration_sec:g}s" + (f"_{tag}" if tag else "")
+
+def run_daq(device_name: str, duty: int, rpm: int, fs: int = 48000, duration_sec: float = 5.0, tag: str = '',
+            out_dir: str = None):
+    """
+    執行 NI-9234 雙通道擷取並儲存數據 (.wav 與 .npz)。
+
+    存到 out_dir，預設 MEASUREMENTS_DIR/<今天日期 YYYY-MM-DD>/。檔名由 record_name() 依 duty、轉速、秒數與標籤組成；
+    npz 另存 duty、rpm、tag 與錄音開始時間 recorded，檔案改名或搬走也不會遺失。
+    已有同名檔案時不擷取，避免覆蓋舊的錄音。
+
     Args:
         device_name (str): NI DAQ 裝置名稱。
+        duty (int): 風扇 duty (%)，1-100。
+        rpm (int): 錄音當下的風扇轉速讀數 (rpm)。
         fs (int): 取樣頻率。
         duration_sec (float): 擷取持續時間。
-        filename (str): 檔案名稱。
+        tag (str): 標籤 (mic 位置等)，英數字和 -，可空白。
+        out_dir (str): 存檔資料夾；None 時用 MEASUREMENTS_DIR/<今天日期>/。
     Example:
-        run_daq(device_name="cDAQ1Mod1", fs=48000, duration_sec=10.0, filename="test_acquisition")
+        run_daq(device_name="cDAQ1Mod1", duty=100, rpm=36159, fs=48000, duration_sec=60.0, tag="refA")
     """
+    if out_dir is None:
+        out_dir = os.path.join(MEASUREMENTS_DIR, datetime.date.today().isoformat())
+    name = record_name(duty, rpm, duration_sec, tag)
+    filename = os.path.join(out_dir, name)
+    existing = [f"{name}{ext}" for ext in ('.wav', '.npz') if os.path.exists(f"{filename}{ext}")]
+    if existing:
+        print(f"{out_dir} 已有同名檔案 {', '.join(existing)}，不擷取以免覆蓋。請確認 duty 與轉速讀數，或換一個標籤。")
+        return
+
     try:
+        recorded = datetime.datetime.now().isoformat(timespec='seconds')
         x_rec, d_rec, actual_fs = acquire_ni9234_dual_channel(
             device_name=device_name,
             fs=fs,
@@ -140,8 +185,10 @@ def run_daq(device_name: str, fs: int = 48000, duration_sec: float = 5.0, filena
         print(f"d 陣列形狀: {d_rec.shape}, 數值範圍: [{d_rec.min():.4f}, {d_rec.max():.4f}] V")
 
         # 儲存數據
+        os.makedirs(out_dir, exist_ok=True)
         save_acquisition_data(filename, x_rec, d_rec, actual_fs, format='wav')
-        save_acquisition_data(filename, x_rec, d_rec, actual_fs, format='npz')
+        save_acquisition_data(filename, x_rec, d_rec, actual_fs, format='npz', duty=duty, rpm=rpm, tag=tag,
+                              recorded=recorded)
 
         # 繪製前 1000 個取樣點驗證
         import matplotlib.pyplot as plt
@@ -161,4 +208,16 @@ def run_daq(device_name: str, fs: int = 48000, duration_sec: float = 5.0, filena
         print("請確認 NI-DAQmx 驅動程式已安裝，且裝置名稱與 NI MAX 中顯示一致。")
 
 if __name__ == "__main__":
-    run_daq(device_name="cDAQ1Mod1", fs=48000, duration_sec=60.0, filename="100_dual_36159_60s")
+    # 每次錄音都重新輸入 duty、轉速讀數與標籤，檔名由程式組成，不會沿用上一段的轉速
+    # 存到 MEASUREMENTS_DIR/<今天日期>/ (這個 repo 的 measurements/)
+    duration_sec = 60.0
+    try:
+        duty = int(input("風扇 duty (%): "))
+        rpm = int(input("風扇轉速讀數 (rpm): "))
+        tag = input("標籤 (mic 位置等，英數字和 -，可空白): ").strip()
+        name = record_name(duty, rpm, duration_sec, tag)
+        print(f"存到 {os.path.join(MEASUREMENTS_DIR, datetime.date.today().isoformat(), name)}")
+    except ValueError as e:
+        print(f"輸入無效: {e}")
+    else:
+        run_daq(device_name="cDAQ1Mod1", duty=duty, rpm=rpm, fs=48000, duration_sec=duration_sec, tag=tag)
