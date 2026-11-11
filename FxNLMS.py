@@ -29,6 +29,10 @@ FW_EPSILON = 1e-11         # 正規化分母底限 (板子單位，約為風扇�
 FW_OUTPUT_LIMIT = 0.2      # 輸出限幅 ANC_SAFE_OUTPUT_LIMIT (100% duty 時 600 Hz 約需 0.2、3.6 kHz 約需 0.7)
 FW_REF_BAND = (400, 5000)  # 迴路內參考帶通 (Hz)
 
+# 評估用的倍頻程頻帶，固定、不隨轉速改變
+OCTAVE_CENTERS = 1000 * 2.0 ** np.arange(-5, 5)   # 倍頻程中心 31.25 Hz ... 16 kHz，頻帶 fc/√2 ~ fc·√2
+OCTAVE_NAMES = ('31.5', '63', '125', '250', '500', '1k', '2k', '4k', '8k', '16k')
+
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
     產生複雜的噪音源 x(n)，包含主頻、倍頻和寬頻雜訊
@@ -1022,9 +1026,7 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
                                         F_hat: np.ndarray,
                                         ref_sos: np.ndarray,
                                         fs: int = 48000,
-                                        eval_filter: FIRFilter = None,
                                         frequencies_to_mark: tuple = (600, 3600),
-                                        lf_band: tuple = (100, 300),
                                         visualize: bool = True,
                                         mu_no_filter: float = None,
                                         **fxnlms_kwargs) -> dict:
@@ -1044,9 +1046,7 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         F_hat (np.ndarray): 回授路徑估測脈衝響應
         ref_sos (np.ndarray): 迴路內參考濾波器 (scipy sos 格式)
         fs (int): 取樣率
-        eval_filter (FIRFilter): 選用，計算評估頻段降噪量的濾波器 (事後分析，可以用零相位)
         frequencies_to_mark (tuple): 要標示窄頻降噪量的頻率 (Hz)
-        lf_band (tuple): 檢查低頻惡化的頻帶 (Hz)
         visualize (bool): 是否繪圖
         mu_no_filter (float): 不濾波那次的步長 (例如 FW_MU_NO_FILTER)；None 表示與濾波那次相同。
                               不濾波時低頻佔滿 x'，同樣的步長可能在低頻發散，所以兩者通常要用各自穩定的步長比較
@@ -1055,7 +1055,7 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
 
     Returns:
         dict: {'no filter': {...}, 'in-loop filter': {...}}，各含 e, y, w, f, attenuation, marked,
-              lf_worst_db, full_band_db, in_band_db
+              full_band_db, octave_db (OCTAVE_CENTERS 各倍頻程的降噪量)
     """
     results = {}
     for label, sos in (('no filter', None), ('in-loop filter', ref_sos)):
@@ -1067,21 +1067,20 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         f, attenuation, marked = plot_psd_comparison(d, e, fs=fs, nfft=8192,
                                                      frequencies_to_mark=list(frequencies_to_mark),
                                                      visualize=visualize)
-        # 與 plot_psd_comparison 相同，取後半段 (已收斂) 計算
+        # 與 plot_psd_comparison 相同，取後半段 (已收斂) 計算；d、e 都不濾波
         half = min(len(d), len(e)) // 2
         full_band_db = 10 * np.log10(np.mean(d[half:]**2) / np.mean(e[half:]**2))
-        lf = (f >= lf_band[0]) & (f <= lf_band[1])
-        lf_worst_db = attenuation[lf].min()
-        in_band_db = None
-        if eval_filter is not None:
-            d_in = eval_filter.filter_zero_phase(d[half:])
-            e_in = eval_filter.filter_zero_phase(e[half:])
-            in_band_db = 10 * np.log10(np.mean(d_in**2) / np.mean(e_in**2))
-        print(f"全頻段降噪量: {full_band_db:+.2f} dB"
-              + ("" if in_band_db is None else f", 評估頻段降噪量: {in_band_db:+.2f} dB")
-              + f", {lf_band[0]}-{lf_band[1]} Hz 最差: {lf_worst_db:+.2f} dB")
+        # 倍頻程降噪量：加總 d、e 的 PSD 在各倍頻程內的能量；頻帶固定、不隨轉速改變，負值表示該頻帶變大聲
+        f_p, p_d = signal.welch(d[half:], fs=fs, window='hann', nperseg=8192)
+        _, p_e = signal.welch(e[half:], fs=fs, window='hann', nperseg=8192)
+        octave_db = np.array([10 * np.log10(p_d[band].sum() / p_e[band].sum())
+                              for band in ((f_p >= fc / np.sqrt(2)) & (f_p < fc * np.sqrt(2)) for fc in OCTAVE_CENTERS)])
+        worst = int(np.argmin(octave_db))
+        print(f"全頻段降噪量: {full_band_db:+.2f} dB")
+        print("倍頻程降噪量 (dB): " + " | ".join(f"{name} {db:+.1f}" for name, db in zip(OCTAVE_NAMES, octave_db))
+              + f"；最差 {OCTAVE_NAMES[worst]} Hz {octave_db[worst]:+.1f} dB")
         results[label] = dict(e=e, y=y, w=w, f=f, attenuation=attenuation, marked=marked,
-                              lf_worst_db=lf_worst_db, full_band_db=full_band_db, in_band_db=in_band_db)
+                              full_band_db=full_band_db, octave_db=octave_db)
     return results
 
 # ==========================================
@@ -1595,8 +1594,7 @@ if __name__ == "__main__":
     # 不濾波時用 FW_MU_NO_FILTER：用 FW_MU 會在低頻發散 (100-300 Hz 惡化約 -47 dB)
     ref_sos = signal.butter(4, FW_REF_BAND, 'bandpass', fs=dsp_fs, output='sos')
     compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, fs=dsp_fs,
-                                        eval_filter=FIRFilter(cutoff=[300, 4000], fs=dsp_fs), clamp=1.0,
-                                        mu_no_filter=FW_MU_NO_FILTER)
+                                        clamp=1.0, mu_no_filter=FW_MU_NO_FILTER)
     # 舊的 ADAU1787 Biquad 流程 (8 月的 REW S，SC598 已不使用):
     # S_rew = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     # sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
