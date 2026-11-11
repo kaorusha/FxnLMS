@@ -27,11 +27,15 @@ FW_MU_NO_FILTER = 0.002    # 不濾波時的步長：低頻佔滿 x'，0.01 在 
 FW_LEAK = 1e-5             # 每個核心取樣的漏洩
 FW_EPSILON = 1e-11         # 正規化分母底限 (板子單位，約為風扇關閉時 2048 * x' 功率)
 FW_OUTPUT_LIMIT = 0.2      # 輸出限幅 ANC_SAFE_OUTPUT_LIMIT (100% duty 時 600 Hz 約需 0.2、3.6 kHz 約需 0.7)
-FW_REF_BAND = (400, 5000)  # 迴路內參考帶通 (Hz)
+FW_REF_BAND = (400, 5000)  # 迴路內參考帶通 (Hz)；模擬中 30-100% duty 都適用 (400 Hz 以下的轉速音仍會被消，只是在 x' 佔比較小)
 
 # 評估用的倍頻程頻帶，固定、不隨轉速改變
 OCTAVE_CENTERS = 1000 * 2.0 ** np.arange(-5, 5)   # 倍頻程中心 31.25 Hz ... 16 kHz，頻帶 fc/√2 ~ fc·√2
 OCTAVE_NAMES = ('31.5', '63', '125', '250', '500', '1k', '2k', '4k', '8k', '16k')
+
+# 評估的目標音：由錄音檔名的轉速推算 (fan_tones)，再到 Ref 上找實際頻率 (locate_tones)
+FAN_BLADES = 6             # 風扇葉片數，BPF = 葉片數 × rpm / 60
+TONE_GUESS_TOL = 0.015     # 實際頻率與推算值的容許差，超過時警告；現有 8 段錄音最大 0.8% (20% duty)
 
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
@@ -559,6 +563,69 @@ def load_anc_path_header(file_path: str) -> tuple:
         raise ValueError(f"{file_path}: 係數 {len(taps)} 個，與定義的 {n_taps.group(1)} 不符")
     return taps, int(fs.group(1))
 
+def fan_tones(record_name: str, blades: int = FAN_BLADES) -> tuple:
+    """
+    由錄音檔名的轉速算出風扇轉速音 f0 與葉片通過頻率 (BPF) 的約略值，當作 locate_tones() 的起點。
+
+    用途：決定要量哪一條線，評估時不必依轉速寫死 600 / 3600 Hz。
+    locate_tones() 只在起點 ±5% 內找最大的峰，量到哪一條線取決於起點；單看頻譜也分不出 f0 與 2f0
+    (2f0 與 12f0 同樣是 1:6)。檔名的轉速是錄音當下的讀數，與錄音中的實際頻率差 0.8% 以內，足以選對線，
+    精確頻率再由 locate_tones() 從 Ref 找。
+    檔名的轉速沒有跟著錄音更新時不會報錯，而是量到別條線，例如 50% duty 的錄音給 600 / 3600 Hz 會量到 2f0 與 12f0。
+    compare_anc_with_and_without_filter() 在實際頻率與起點差超過 TONE_GUESS_TOL 時警告 (20%、30% duty 會觸發)，
+    但這種剛好落在倍頻上的情況擋不住。
+
+    檔名檢驗：須為 <duty>_dual_<rpm>_<秒數>s，後面可接 _備註 與副檔名，
+    例如 100_dual_36159_60s.npz -> 36159 rpm -> (602.65, 3615.9) Hz。
+    duty 須在 1-100、rpm 須大於 0，擋住缺欄位或 duty 與轉速填反的檔名。
+
+    Args:
+        record_name (str): 錄音檔名或路徑
+        blades (int): 葉片數
+
+    Returns:
+        tuple: (f0 = rpm / 60, BPF = blades * rpm / 60) (Hz)
+
+    Raises:
+        ValueError: 檔名不符合格式，或 duty、rpm 超出範圍
+    """
+    name = os.path.basename(record_name)
+    m = re.fullmatch(r'(\d+)_dual_(\d+)_\d+(?:\.\d+)?s(?:[_.].*)?', name)
+    if m is None:
+        raise ValueError(f"檔名不符合 <duty>_dual_<rpm>_<秒數>s: {name}")
+    duty, rpm = int(m.group(1)), int(m.group(2))
+    if not (1 <= duty <= 100) or rpm <= 0:
+        raise ValueError(f"檔名的 duty ({duty}) 須在 1-100、轉速 ({rpm}) 須大於 0，duty 與轉速是否填反？: {name}")
+    f_rot = rpm / 60.0
+    return f_rot, blades * f_rot
+
+def locate_tones(x: np.ndarray, guesses, fs: int = 48000, nfft: int = 8192) -> list:
+    """
+    在參考麥克風訊號 x 的頻譜上找出目標音的實際頻率。
+    風扇音在 Ref 上比附近的線都大；Err 上附近可能有其他聲源更大聲的線 (20% duty 的 117 Hz)，所以在 Ref 找。
+
+    Args:
+        x (np.ndarray): 參考麥克風訊號 (取後半段，與評估相同)
+        guesses: 約略頻率 (Hz)，例如 fan_tones() 由檔名轉速算出的值
+        fs (int): 取樣率
+        nfft (int): Welch 分段長度
+
+    Returns:
+        list: 實際頻率 (Hz)。在約略頻率 ±5% (至少 ±15 Hz) 內找最大的峰，再用拋物線內插到頻點之間
+    """
+    f, p = signal.welch(x[len(x) // 2:], fs=fs, window='hann', nperseg=nfft)
+    located = []
+    for guess in guesses:
+        r = max(15.0, 0.05 * guess)
+        idx = np.flatnonzero((f >= guess - r) & (f <= guess + r))
+        i = idx[np.argmax(p[idx])]
+        if 0 < i < len(p) - 1:
+            a, b, c = np.log(p[i - 1]), np.log(p[i]), np.log(p[i + 1])
+            located.append(f[i] + 0.5 * (a - c) / (a - 2 * b + c) * (f[1] - f[0]))
+        else:
+            located.append(f[i])
+    return located
+
 def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: float = ADAU1979_FULL_SCALE_VPEAK):
     """
     讀取量測數據，並依據 DSP 硬體滿載電壓將其縮放至 [-1, 1]
@@ -813,6 +880,7 @@ def run_anc_simulation(x: np.ndarray, rew_file_path: str, target_taps: int = 512
 
 def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int = 8192, 
                         frequencies_to_mark: list = [],
+                        search_hz: float = None,
                         visualize: bool = True):
     """
     計算並繪製原始誤差 d(n) 與殘留誤差 e(n) 的功率譜密度 (PSD)。
@@ -825,6 +893,8 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
         fs (int): 取樣率
         nfft (int): FFT 點數 (建議 8192)
         frequencies_to_mark (list): 要標記的目標頻率點列表 (Hz)
+        search_hz (float): 在目標頻率 ±search_hz 內找峰值；None 時用 ±5% (至少 ±15 Hz)。
+                           頻率已知很準時 (例如 locate_tones() 從 Ref 量出) 用一個頻點寬 fs / nfft，避免抓到附近其他聲源的線
         visualize (bool): 是否顯示圖形
     """
     # 確保訊號長度一致，並取最後一半的資料 (確保已達到穩態收斂)
@@ -848,8 +918,8 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
     # 搜尋指定頻率附近的局部峰值 (Local Peak) 並計算降噪量
     marked_info = []
     for freq in frequencies_to_mark:
-        # 動態搜尋半徑 (預設 +-5% 或至少 +-25Hz)
-        search_range = max(15.0, freq * 0.05)
+        # 搜尋半徑：search_hz，或預設 +-5% (至少 +-15 Hz)
+        search_range = search_hz if search_hz is not None else max(15.0, freq * 0.05)
         search_idx = np.where((f_d >= freq - search_range) & (f_d <= freq + search_range))[0]
         
         if len(search_idx) > 0:
@@ -862,7 +932,7 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
         actual_freq = f_d[idx]
         att_val = attenuation[idx]
         marked_info.append((freq, actual_freq, att_val))
-        print(f"Target: {freq} Hz -> Local Peak: {actual_freq:.1f} Hz, Attenuation: {att_val:+.2f} dB")
+        print(f"Target: {freq:.1f} Hz -> Local Peak: {actual_freq:.1f} Hz, Attenuation: {att_val:+.2f} dB")
 
     if visualize:
         # 繪圖
@@ -1025,8 +1095,8 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
                                         S_hat: np.ndarray,
                                         F_hat: np.ndarray,
                                         ref_sos: np.ndarray,
+                                        frequencies_to_mark: tuple,
                                         fs: int = 48000,
-                                        frequencies_to_mark: tuple = (600, 3600),
                                         visualize: bool = True,
                                         mu_no_filter: float = None,
                                         **fxnlms_kwargs) -> dict:
@@ -1045,8 +1115,11 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         S_hat (np.ndarray): 次級路徑估測脈衝響應
         F_hat (np.ndarray): 回授路徑估測脈衝響應
         ref_sos (np.ndarray): 迴路內參考濾波器 (scipy sos 格式)
+        frequencies_to_mark (tuple): 目標音的約略頻率 (Hz)，例如 fan_tones() 由檔名轉速算出的值。
+                                     先在參考訊號 x 的頻譜 ±5% 內找實際頻率 (locate_tones)，
+                                     再在 d、e 上實際頻率 ±1 個頻點內量降噪量；
+                                     實際頻率與約略值差超過 TONE_GUESS_TOL 時警告 (檔名轉速可能不是這段錄音的)
         fs (int): 取樣率
-        frequencies_to_mark (tuple): 要標示窄頻降噪量的頻率 (Hz)
         visualize (bool): 是否繪圖
         mu_no_filter (float): 不濾波那次的步長 (例如 FW_MU_NO_FILTER)；None 表示與濾波那次相同。
                               不濾波時低頻佔滿 x'，同樣的步長可能在低頻發散，所以兩者通常要用各自穩定的步長比較
@@ -1057,6 +1130,13 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
         dict: {'no filter': {...}, 'in-loop filter': {...}}，各含 e, y, w, f, attenuation, marked,
               full_band_db, octave_db (OCTAVE_CENTERS 各倍頻程的降噪量)
     """
+    # 目標音的實際頻率在參考訊號 x 上找：檔名轉速會浮動，而 Err 上附近可能有其他聲源更大聲的線
+    tones = locate_tones(x, frequencies_to_mark, fs=fs)
+    dev = [t / g - 1 for g, t in zip(frequencies_to_mark, tones)]
+    print("目標音 (Ref 實測): " + ", ".join(f"{t:.1f} Hz (給定 {g:.1f}, {100 * r:+.2f}%)"
+                                         for g, t, r in zip(frequencies_to_mark, tones, dev)))
+    if max(abs(r) for r in dev) > TONE_GUESS_TOL:
+        print(f"警告: 實際頻率與給定值差超過 {100 * TONE_GUESS_TOL:.1f}%，給定值 (檔名轉速) 可能不是這段錄音的，量到的可能是別條線")
     results = {}
     for label, sos in (('no filter', None), ('in-loop filter', ref_sos)):
         kwargs = dict(fxnlms_kwargs)
@@ -1064,9 +1144,9 @@ def compare_anc_with_and_without_filter(x: np.ndarray,
             kwargs['mu'] = mu_no_filter
         print(f"\n=== {label}, mu = {kwargs.get('mu', FW_MU)} ===")
         e, y, w, _ = run_fxnlms(x, d, S, S_hat, F_hat, ref_sos=sos, **kwargs)
-        f, attenuation, marked = plot_psd_comparison(d, e, fs=fs, nfft=8192,
-                                                     frequencies_to_mark=list(frequencies_to_mark),
-                                                     visualize=visualize)
+        # 在實測頻率 ±1 個頻點內找 d 的峰值，避免抓到附近其他聲源的線
+        f, attenuation, marked = plot_psd_comparison(d, e, fs=fs, nfft=8192, frequencies_to_mark=tones,
+                                                     search_hz=fs / 8192, visualize=visualize)
         # 與 plot_psd_comparison 相同，取後半段 (已收斂) 計算；d、e 都不濾波
         half = min(len(d), len(e)) // 2
         full_band_db = 10 * np.log10(np.mean(d[half:]**2) / np.mean(e[half:]**2))
@@ -1582,6 +1662,7 @@ def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bod
 if __name__ == "__main__":
     dsp_fs = FW_FS
     record_name = "100_dual_36159_60s.npz"
+    tones = fan_tones(record_name)   # (轉速音, BPF) 的約略值，由檔名的轉速算出；實際頻率在 compare 裡從 Ref 找
     x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)   # 板子單位 (ADAU1979 滿刻度)
     # 板子經 48 kHz 核心邊界量到的 S / F (韌體 repo 的 second_path.h / feedback_path.h)
     # 錄音時喇叭靜音，x 不含回授；run_fxnlms 會把喇叭回授 F 加回參考麥克風，再用 F_hat 扣掉
@@ -1593,8 +1674,8 @@ if __name__ == "__main__":
     # (韌體的 FW_OUTPUT_LIMIT = 0.2 在 100% duty 會一直截斷：600 Hz 約需 0.2、3.6 kHz 約需 0.7)
     # 不濾波時用 FW_MU_NO_FILTER：用 FW_MU 會在低頻發散 (100-300 Hz 惡化約 -47 dB)
     ref_sos = signal.butter(4, FW_REF_BAND, 'bandpass', fs=dsp_fs, output='sos')
-    compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, fs=dsp_fs,
-                                        clamp=1.0, mu_no_filter=FW_MU_NO_FILTER)
+    compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, tones,
+                                        fs=dsp_fs, clamp=1.0, mu_no_filter=FW_MU_NO_FILTER)
     # 舊的 ADAU1787 Biquad 流程 (8 月的 REW S，SC598 已不使用):
     # S_rew = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     # sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
