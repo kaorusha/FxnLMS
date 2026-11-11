@@ -1,6 +1,5 @@
 *.npz
 *.wav
 *.txt
-record/*
 .vscode/*
 measurements/
