@@ -21,14 +21,16 @@ ADAU1979_FULL_SCALE_VPEAK = 2.25 * np.sqrt(2)
 ADAU1787_FULL_SCALE_VPEAK = 0.707
 
 # 韌體 ANC 核心設定，模擬的預設值與韌體一致
-# (mu、epsilon 為 2026-11-09 建議的修正值，anc_fxnlms.h 尚未更新)
+# (2026-11-11 起 anc_fxnlms.h 用同樣的 mu、epsilon；韌體的參考帶通可選 400-1500 / 400-5000 Hz，
+#  第一次 ANC 實測用 400-1500，之後換 400-5000；限幅 2026-11-16 起為 0.9)
 FW_FS = 48000              # ANC 核心取樣率 (Hz)
 FW_W_TAPS = 2048           # W(z) 階數
 FW_MU = 0.01               # 搭配迴路內參考帶通 FW_REF_BAND
 FW_MU_NO_FILTER = 0.002    # 不濾波時的步長：低頻佔滿 x'，0.01 在 100% duty 會在低頻發散
 FW_LEAK = 1e-5             # 每個核心取樣的漏洩
 FW_EPSILON = 1e-11         # 正規化分母底限 (板子單位，約為風扇關閉時 2048 * x' 功率)
-FW_OUTPUT_LIMIT = 0.2      # 輸出限幅 ANC_SAFE_OUTPUT_LIMIT (100% duty 時 600 Hz 約需 0.2、3.6 kHz 約需 0.7)
+FW_OUTPUT_LIMIT = 0.9      # 輸出限幅 ANC_SAFE_OUTPUT_LIMIT (2026-11-16 喇叭測試：兩音峰值 0.92 連放 5 分鐘無失真；
+                           # 100% duty 時 600 Hz 約需 0.2、3.6 kHz 約需 0.7)
 FW_REF_BAND = (400, 5000)  # 迴路內參考帶通 (Hz)；模擬中 30-100% duty 都適用 (400 Hz 以下的轉速音仍會被消，只是在 x' 佔比較小)
 
 # 評估用的倍頻程頻帶，固定、不隨轉速改變
@@ -1682,7 +1684,7 @@ if __name__ == "__main__":
     x_resample, d_resample, S_z_resample, F_z_resample = resample_for_dsp(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, path_fs=path_fs)
     # 比較不濾波與迴路內參考帶通 (因果 IIR)，兩者都用未濾波的 d / e 評估
     # 其餘參數用韌體預設值 (FW_*)；限幅放到 DAC 滿刻度 1.0，先比較濾波器位置本身的效果
-    # (韌體的 FW_OUTPUT_LIMIT = 0.2 在 100% duty 會一直截斷：600 Hz 約需 0.2、3.6 kHz 約需 0.7)
+    # (韌體的 FW_OUTPUT_LIMIT 是 0.9；100% duty 的 600 Hz 約需 0.2、3.6 kHz 約需 0.7，合計峰值約 0.9)
     # 不濾波時用 FW_MU_NO_FILTER：用 FW_MU 會在低頻發散 (100-300 Hz 惡化約 -47 dB)
     ref_sos = signal.butter(4, FW_REF_BAND, 'bandpass', fs=dsp_fs, output='sos')
     compare_anc_with_and_without_filter(x_resample, d_resample, S_z_resample, S_z_resample, F_z_resample, ref_sos, tones,
